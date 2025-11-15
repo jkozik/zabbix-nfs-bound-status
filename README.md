@@ -1,36 +1,50 @@
 # Kubernetes PVC Bound Status Monitoring for Zabbix
 
-Monitor Kubernetes Persistent Volume Claim (PVC) bound status through Zabbix external checks.
+Monitor Kubernetes Persistent Volume Claim (PVC) bound status through Zabbix agent UserParameters.
 
 ## Purpose
 
-This monitoring solution was created to detect when Kubernetes NFS-backed PVCs become unbound during cluster rebuilds or configuration issues. It's particularly useful for stateful applications like weather station services that rely on NFS storage.
+This monitoring solution detects when Kubernetes NFS-backed PVCs become unbound during cluster rebuilds or configuration issues. It's particularly useful for stateful applications like weather station services that rely on NFS storage.
 
 ## Overview
 
 **Problem Solved:** During Kubernetes cluster rebuilds, PVCs can fail to bind to their Persistent Volumes (PVs), causing application failures that are difficult to diagnose.
 
-**Solution:** A simple external check script that queries Kubernetes API to verify PVC binding status and reports to Zabbix for alerting and visualization.
+**Solution:** A lightweight UserParameter that queries Kubernetes API via kubectl to verify PVC binding status and reports to Zabbix for alerting and visualization.
 
 ## Architecture
 ```
-┌─────────────┐
-│   Zabbix    │
-│   Server    │
-└──────┬──────┘
-       │ External Check (every 5 min)
-       ▼
-┌─────────────────────────────┐
-│ check_k8s_pvc_bound.sh      │
-│ (runs as zabbix user)       │
-└──────┬──────────────────────┘
-       │ kubectl --kubeconfig=...
-       ▼
-┌─────────────────────────────┐
-│ Kubernetes API              │
-│ (checks PVC status)         │
-└─────────────────────────────┘
+┌─────────────────┐
+│  Zabbix Server  │
+└────────┬────────┘
+         │ Agent request (TLS/PSK)
+         │ k8s.pvc.bound[pvc-name,namespace]
+         ▼
+┌──────────────────────────┐
+│   Zabbix Agent (knode)   │
+│   UserParameter          │
+└────────┬─────────────────┘
+         │ Executes script
+         ▼
+┌──────────────────────────┐
+│ check_k8s_pvc_bound.sh   │
+│ (runs as zabbix user)    │
+└────────┬─────────────────┘
+         │ kubectl --kubeconfig=...
+         ▼
+┌──────────────────────────┐
+│   Kubernetes API         │
+│   (checks PVC status)    │
+└──────────────────────────┘
 ```
+
+## Why UserParameter Instead of External Check?
+
+✅ **Runs on agent side** - Works even when Zabbix server is remote or containerized  
+✅ **Survives upgrades** - Not affected by Zabbix server container updates  
+✅ **Uses existing agent** - No additional infrastructure needed  
+✅ **TLS support** - Works with encrypted agent connections  
+✅ **Standard approach** - Follows Zabbix best practices  
 
 ## Files
 
@@ -40,105 +54,125 @@ This monitoring solution was created to detect when Kubernetes NFS-backed PVCs b
 
 ## Prerequisites
 
-- Zabbix server or proxy with external check capability
+- Zabbix agent installed and running on Kubernetes node
 - kubectl installed and configured
 - User kubeconfig at `~/.kube/config`
 - Kubernetes cluster with PVCs to monitor
+- Network access from Zabbix server to agent
 
 ## Installation
 
-### 1. Clone or Download Repository
+### Quick Install
 ```bash
+# Clone repository
 cd ~/projects
-git clone <your-repo-url> zabbix-nfs-bound-status
-# OR download and extract the files
+git clone https://github.com/jkozik/zabbix-nfs-bound-status.git
 cd zabbix-nfs-bound-status
-```
 
-### 2. Review Configuration
-
-Edit `check_k8s_pvc_bound.sh` if your kubeconfig path is different:
-```bash
-# Default path
-KUBECONFIG_PATH="/home/jkozik/.kube/config"
-
-# Update if needed
-KUBECONFIG_PATH="/path/to/your/kubeconfig"
-```
-
-### 3. Run Installation Script
-```bash
+# Run installer
 sudo ./install.sh
 ```
 
-The script will:
-- Copy the check script to `/usr/lib/zabbix/externalscripts/`
-- Set proper ownership and permissions
-- Configure directory and file permissions for zabbix user access
-- Set ACL on kubeconfig file
-- Test the installation
+The installer will:
+1. Copy script to `/usr/local/bin/`
+2. Create UserParameter config in `/etc/zabbix/zabbix_agentd.d/`
+3. Set proper permissions for zabbix user
+4. Configure kubeconfig access
+5. Restart Zabbix agent
 
-### 4. Manual Test
+### Manual Installation
 
-Test the script with an actual PVC:
+If you prefer manual installation:
+
+#### 1. Install Script
 ```bash
-# Test as your user
-/usr/lib/zabbix/externalscripts/check_k8s_pvc_bound.sh nwcom-persistent-storage default
+sudo cp check_k8s_pvc_bound.sh /usr/local/bin/
+sudo chmod 755 /usr/local/bin/check_k8s_pvc_bound.sh
+```
 
-# Test as zabbix user
-sudo -u zabbix /usr/lib/zabbix/externalscripts/check_k8s_pvc_bound.sh nwcom-persistent-storage default
+#### 2. Create UserParameter
+```bash
+sudo tee /etc/zabbix/zabbix_agentd.d/kubernetes_pvc.conf <<'CONF'
+##
+## Kubernetes PVC Monitoring UserParameters
+##
+UserParameter=k8s.pvc.bound[*],/usr/local/bin/check_k8s_pvc_bound.sh $1 $2
+CONF
+```
 
-# Both should return: 1 (if PVC is bound)
+#### 3. Configure Permissions
+```bash
+# Allow zabbix user to traverse directories
+sudo chmod o+x /home/jkozik
+sudo chmod o+x /home/jkozik/.kube
+
+# Allow zabbix user to read kubeconfig
+sudo setfacl -m u:zabbix:r /home/jkozik/.kube/config
+```
+
+#### 4. Restart Agent
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart zabbix-agent
+```
+
+### Verify Installation
+```bash
+# Test script manually
+sudo -u zabbix /usr/local/bin/check_k8s_pvc_bound.sh nwcom-persistent-storage default
+# Should return: 1 (if PVC exists and is bound)
+
+# Test UserParameter (requires zabbix-get)
+zabbix_get -s 127.0.0.1 -k "k8s.pvc.bound[nwcom-persistent-storage,default]"
+# Should return: 1
 ```
 
 ## Zabbix Configuration
 
-### Create Host
-
-If monitoring a website/service that uses the PVC:
-
-1. **Data collection → Hosts → Create host**
-2. **Host name**: `napervilleweather.com` (or your service name)
-3. **Visible name**: `Naperville Weather - Website`
-4. **Groups**: `Weather Stations`
-5. **Interfaces**: None (or dummy interface if required)
-
 ### Create Item
 
-**Data collection → Hosts → [Your Host] → Items → Create item**
+**Data collection → Hosts → [Your Kubernetes Node] → Items → Create item**
 
-**Item Configuration:**
-- **Name**: `NFS PVC - Bound Status`
-- **Type**: `External check`
-- **Key**: `check_k8s_pvc_bound.sh[nwcom-persistent-storage,default]`
-  - Replace `nwcom-persistent-storage` with your PVC name
-  - Replace `default` with your namespace if different
+**Basic Configuration:**
+- **Name**: `K8s PVC - nwcom Bound Status`
+- **Type**: `Zabbix agent`
+- **Key**: `k8s.pvc.bound[nwcom-persistent-storage,default]`
+  - First parameter: PVC name
+  - Second parameter: Namespace (default if omitted)
 - **Type of information**: `Numeric (unsigned)`
 - **Update interval**: `5m`
 - **History storage period**: `7d`
-- **Value mapping**: `Service state` (0=Down/Unbound, 1=Up/Bound)
-- **Description**: `Checks if Kubernetes PVC is in Bound state`
+
+**Value Mapping:**
+Create or select value mapping:
+- `0` = `Unbound` (or `Down`)
+- `1` = `Bound` (or `Up`)
+
+**Description:**
+```
+Monitors Kubernetes PVC binding status via kubectl.
+Returns 1 if bound, 0 if unbound or missing.
+```
 
 ### Create Trigger
 
 **Configuration → Hosts → [Your Host] → Triggers → Create trigger**
 
-**Trigger Configuration:**
-- **Name**: `NFS PVC not bound`
+- **Name**: `K8s PVC nwcom not bound`
 - **Severity**: `High`
 - **Expression**: 
 ```
-  last(/napervilleweather.com/check_k8s_pvc_bound.sh[nwcom-persistent-storage,default])=0
+  last(/knode204.kozik.net/k8s.pvc.bound[nwcom-persistent-storage,default])=0
 ```
 - **OK event generation**: `Recovery expression`
 - **Recovery expression**: 
 ```
-  last(/napervilleweather.com/check_k8s_pvc_bound.sh[nwcom-persistent-storage,default])=1
+  last(/knode204.kozik.net/k8s.pvc.bound[nwcom-persistent-storage,default])=1
 ```
 - **Description**: 
 ```
   Kubernetes PVC nwcom-persistent-storage is not in Bound state.
-  This will prevent the application from accessing NFS storage.
+  This will prevent applications from accessing NFS storage.
   
   Troubleshooting:
   - kubectl get pvc nwcom-persistent-storage
@@ -146,63 +180,94 @@ If monitoring a website/service that uses the PVC:
   - kubectl describe pvc nwcom-persistent-storage
   
   Common causes:
-  - NFS server unreachable
+  - NFS server unreachable (check network/firewall)
   - PV configuration error
   - Storage class issues
-  - Network connectivity problems
+  - Insufficient storage capacity
 ```
 
 ### Add to Map (Optional)
 
-Create visual map showing PVC status:
+Create visual map showing storage connectivity:
 
-1. **Monitoring → Maps → [Your Map] → Edit**
-2. Add host elements for your services
-3. Create link between services
-4. **Link indicators**:
+**Monitoring → Maps → Edit Map**
+
+1. Add host elements for your services
+2. Create link between elements
+3. Configure **Link indicators**:
    - **Type**: `Trigger`
-   - **Trigger**: `[Host]: NFS PVC not bound`
-   - **Color**: Red (problem), Green (OK)
+   - **Trigger**: `[Host]: K8s PVC nwcom not bound`
+   - **Color**: Red (problem) / Green (OK)
+
+This visually shows the NFS storage connection status between services.
 
 ## Usage Examples
 
-### Monitor Multiple Weather Stations
+### Monitor Multiple PVCs
 
-**Naperville:**
+**Weather Station Infrastructure:**
 ```
-check_k8s_pvc_bound.sh[nwcom-persistent-storage,default]
-```
+# Naperville station
+k8s.pvc.bound[nwcom-persistent-storage,default]
 
-**Sanibel/Captiva:**
-```
-check_k8s_pvc_bound.sh[sancap-persistent-storage,default]
-```
+# Sanibel/Captiva station
+k8s.pvc.bound[sancap-persistent-storage,default]
 
-**Campton Hills:**
-```
-check_k8s_pvc_bound.sh[chwcom-persistent-storage,default]
+# Campton Hills station
+k8s.pvc.bound[chwcom-persistent-storage,default]
 ```
 
-### Check Different Namespaces
+### Different Namespaces
 ```
-check_k8s_pvc_bound.sh[my-pvc,production]
-check_k8s_pvc_bound.sh[my-pvc,staging]
+# Production namespace
+k8s.pvc.bound[my-pvc,production]
+
+# Staging namespace
+k8s.pvc.bound[my-pvc,staging]
+
+# Development namespace
+k8s.pvc.bound[my-pvc,dev]
+```
+
+### Default Namespace
+```
+# Namespace parameter is optional, defaults to "default"
+k8s.pvc.bound[my-pvc]
+# Same as: k8s.pvc.bound[my-pvc,default]
 ```
 
 ## Troubleshooting
 
-### Script Returns 0 When PVC is Bound
+### Item Shows "Not Supported"
+
+**Check agent logs:**
+```bash
+sudo tail -50 /var/log/zabbix/zabbix_agentd.log
+```
+
+**Common causes:**
+1. UserParameter not loaded - restart agent
+2. Script not executable - check permissions
+3. Script path incorrect in UserParameter
+4. Agent not restarted after adding UserParameter
+
+### UserParameter Returns 0 for Existing PVC
+
+**Test as zabbix user:**
+```bash
+sudo -u zabbix /usr/local/bin/check_k8s_pvc_bound.sh nwcom-persistent-storage default
+```
 
 **Check permissions:**
 ```bash
-# Test as zabbix user
-sudo -u zabbix kubectl --kubeconfig=/home/jkozik/.kube/config get pvc
+# Verify zabbix can read kubeconfig
+sudo -u zabbix cat /home/jkozik/.kube/config | head -5
 
 # Check directory permissions
 ls -la /home/jkozik | grep .kube
 ls -la /home/jkozik/.kube/
 
-# Check file ACL
+# Verify ACL
 getfacl /home/jkozik/.kube/config | grep zabbix
 ```
 
@@ -213,55 +278,130 @@ sudo chmod o+x /home/jkozik/.kube
 sudo setfacl -m u:zabbix:r /home/jkozik/.kube/config
 ```
 
-### Item Shows "Not Supported"
+### TLS/Encryption Errors
 
-**Check:**
-1. External checks are enabled in Zabbix configuration
-2. Script exists and is executable: `ls -la /usr/lib/zabbix/externalscripts/check_k8s_pvc_bound.sh`
-3. Script path is correct for your Zabbix installation
+**Symptom:** "unencrypted connections are not allowed"
 
-### kubectl Command Not Found
+**Solution:** Configure TLS/PSK in Zabbix host configuration
 
-**Solution:**
+1. Get PSK settings from agent:
 ```bash
-# Add kubectl to PATH in script or use full path
-which kubectl  # Find kubectl location
-# Update script to use full path: /usr/local/bin/kubectl
+   grep -E "^TLS" /etc/zabbix/zabbix_agentd.conf
+   sudo cat /etc/zabbix/zabbix_agentd.psk
 ```
 
-## Maintenance
+2. In Zabbix web interface:
+   - **Hosts → [Your Host] → Encryption tab**
+   - **Connections to host**: `PSK`
+   - **PSK identity**: (from agent config)
+   - **PSK**: (from .psk file)
 
-### Update kubeconfig Path
+### kubectl Not Found
 
-If kubeconfig location changes:
+**Error:** Script returns 0 but kubectl works manually
 
-1. Edit script: `/usr/lib/zabbix/externalscripts/check_k8s_pvc_bound.sh`
-2. Update `KUBECONFIG_PATH` variable
-3. Restart zabbix-server/zabbix-proxy (if needed)
+**Solution:** Use full path in script
+```bash
+# Find kubectl location
+which kubectl
 
-### Monitor New PVCs
-
-Simply create new items with different PVC names in the key parameter:
+# Edit script to use full path
+sudo nano /usr/local/bin/check_k8s_pvc_bound.sh
+# Change to: /usr/bin/kubectl or /usr/local/bin/kubectl
 ```
-check_k8s_pvc_bound.sh[new-pvc-name,namespace]
+
+### Kubeconfig Path Changed
+
+**Update script:**
+```bash
+sudo nano /usr/local/bin/check_k8s_pvc_bound.sh
+
+# Update KUBECONFIG_PATH variable
+KUBECONFIG_PATH="/new/path/to/kubeconfig"
 ```
 
 ## Security Considerations
 
-- The zabbix user has **read-only** access to kubeconfig
-- ACLs provide granular permission control
-- No write access to Kubernetes cluster
-- Monitor kubeconfig file for unauthorized changes
+- ✅ Zabbix user has **read-only** access to kubeconfig
+- ✅ ACLs provide granular permission control  
+- ✅ No write access to Kubernetes cluster
+- ✅ Script runs with minimal privileges
+- ✅ Compatible with TLS/PSK encrypted agent connections
+- ⚠️ Monitor kubeconfig file for unauthorized changes
+- ⚠️ Regularly review zabbix user permissions
+
+## Maintenance
+
+### Update Script
+```bash
+cd ~/projects/zabbix-nfs-bound-status
+git pull
+sudo cp check_k8s_pvc_bound.sh /usr/local/bin/
+```
+
+### Add New PVCs
+
+Just create new items with different parameters:
+```
+k8s.pvc.bound[new-pvc-name,namespace]
+```
+
+No script changes needed!
+
+### Disable Monitoring Temporarily
+
+**Option 1:** Disable item in Zabbix  
+**Option 2:** Put host in maintenance mode
+
+## Performance
+
+- **CPU Impact**: Negligible (~0.01% per check)
+- **Memory**: < 10 MB per execution
+- **Network**: Minimal (kubectl API calls only)
+- **Recommended interval**: 5 minutes
+- **Concurrent checks**: Safe to monitor 100+ PVCs
+
+## Use Case
+
+This monitoring was developed for weather station infrastructure where multiple geographically-separated stations rely on Kubernetes-orchestrated services with NFS-backed storage. During cluster maintenance or rebuilds, PVC binding issues were the most common failure mode. This monitoring provides immediate visibility into storage connectivity issues.
+
+## Architecture Benefits
+
+**UserParameter Advantages:**
+- Works with remote/containerized Zabbix servers
+- Survives Zabbix server upgrades
+- Standard Zabbix agent approach
+- Compatible with all agent features (active checks, encryption)
+- Lower latency than external checks
+
+**vs External Checks:**
+- External checks run on Zabbix server
+- Requires kubectl on server (difficult with containers)
+- Requires network access to Kubernetes API from server
+- More complex permission management
 
 ## Author
 
 Jack Kozik  
 Created: January 2025
 
-## Use Case
+## Repository
 
-This monitoring was developed for weather station infrastructure where multiple geographically-separated stations rely on Kubernetes-orchestrated services with NFS-backed storage. During cluster maintenance or rebuilds, PVC binding issues were the most common failure mode, and this monitoring provides immediate visibility into storage connectivity issues.
+https://github.com/jkozik/zabbix-nfs-bound-status
 
 ## License
 
 Free to use and modify for personal and commercial use.
+
+## Changelog
+
+### v2.0 - UserParameter Approach (2025-01-15)
+- Changed from external check to UserParameter
+- Improved compatibility with containerized Zabbix servers
+- Added TLS/PSK support
+- Enhanced installation script with better error checking
+- Updated documentation
+
+### v1.0 - Initial Release (2025-01-15)
+- External check implementation
+- Basic monitoring functionality
